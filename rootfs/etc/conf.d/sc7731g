@@ -1,0 +1,14 @@
+# Board settings for the SC7731G frame services (sc7731g-bt, sc7731g-bt-ext).
+# Sourced by their init scripts; everything has a default.
+
+# The WCN's own Bluetooth (BR/EDR only): the PSKEY handed to bt-sc7731g.
+BT_WCN=1
+
+# BLE through an ESP32-C3 on uart1 (c3-hci, docs/ble-c3.md). Off until the
+# C3 is soldered on and the kernel's console has left ttyS1.
+BT_EXT=0
+BT_EXT_UART=/dev/ttyS1
+BT_EXT_BAUD=1000000
+# the IR-IN pad (GPIO 217 = sysfs 729 on gpiochip512) through a Schottky to EN
+BT_EXT_RESET_GPIO=729
+BT_EXT_BOOT_MS=400

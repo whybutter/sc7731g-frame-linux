@@ -1,0 +1,51 @@
+#!/bin/sh
+# pmic-wdt [SECONDS]: arm the SC2713S PMIC watchdog and keep feeding it.
+#
+# Why: the first SMP boot (2026-10-24) hard-hung, and a hung frame sits dead
+# until somebody pulls its plug -- panic=5 can't help when nothing panics.
+# With this running, a hang stops the feeding and the PMIC resets the chip
+# SECONDS later, back into U-Boot and Android, where adb picks it up again.
+# Each feed also writes a line to the kernel log: the console's polled path,
+# so a heartbeat that stops says when the system died even if the UART's
+# interrupt-driven tty output stalled first.
+#
+# Registers are the restart handler's (kernel/patches/0001-spi-sprd-adi-
+# sc7731g.patch, from the vendor's sys_reset.h): watchdog at ADI slave 0x40,
+# global ARM_MODULE_EN 0x800 and RTC_CLK_EN 0x808 (bit 2 each), reset-reason
+# POR_RST_MONITOR 0x8e8. A write to the slave window (0x40038000 + reg) is an
+# ADI write; a read goes through RD_CMD/RD_DATA (see probe's adi()).
+t=${1:-60}
+S=0x40038000
+W=$((S + 0x40))
+
+rd() {
+  devmem 0x40030024 32 $(($S + $1))
+  n=0; v=$(devmem 0x40030028 32)
+  while [ $(( (v >> 31) & 1 )) = 1 ] && [ $n -lt 100 ]; do
+    v=$(devmem 0x40030028 32); n=$((n + 1))
+  done
+  echo $((v & 0xffff))
+}
+wr() { devmem $(($S + $1)) 32 $2; }
+load() {
+  n=$((t * 32768))
+  wr 0x44 $((n >> 16))
+  wr 0x40 $((n & 0xffff))
+}
+
+# a timeout reset should read as an ordinary reboot to U-Boot: reason NORMAL
+# (0x40), as the restart handler records it
+wr 0x8e8 $(( ($(rd 0x8e8) & ~0xf0) | 0x40 ))
+wr 0x800 $(( $(rd 0x800) | 4 ))
+wr 0x808 $(( $(rd 0x808) | 4 ))
+wr 0x60 0xe551				# unlock
+wr 0x48 $(( $(rd 0x48) | 4 ))		# NEW: the 32-bit load
+load
+wr 0x48 $(( $(rd 0x48) | 0xa ))		# RUN | RST_EN
+wr 0x60 0x1aae				# lock
+echo "pmic-wdt: armed, ${t} s, ctrl $(rd 0x48)" > /dev/kmsg
+
+while sleep $((t / 4)); do
+  wr 0x60 0xe551; load; wr 0x60 0x1aae
+  echo "pmic-wdt: fed at $(cut -d' ' -f1 /proc/uptime)" > /dev/kmsg
+done

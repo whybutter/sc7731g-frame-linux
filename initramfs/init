@@ -1,0 +1,90 @@
+#!/bin/sh
+# Bring-up initramfs: a root shell on the UART console, nothing else.
+/bin/busybox --install -s /bin
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev 2>/dev/null
+echo
+echo "vt10101 initramfs: $(uname -r), $(grep -c ^processor /proc/cpuinfo) cpu(s), $(sed -n 's/MemTotal: *//p' /proc/meminfo)"
+# `probe` on the kernel command line: dump what the next drivers need
+# (/bin/probe); `probe_reboot`: then reboot, which is also the test of the
+# PMIC-watchdog restart -- a boot that needs nobody at the frame
+# `frameboot`: the userland from the eMMC's A/B root slots (/bin/frameboot).
+# Before anything else is started: nothing here may outlive switch_root
+# (pmic-wdt, the usbnet shell). On failure it returns and the boot carries
+# on to the switches below and the shell.
+case " $(cat /proc/cmdline) " in
+  *" frameboot "*) . /bin/frameboot; frameboot ;;
+esac
+# `wdt`: arm the PMIC watchdog and feed it from here on (/bin/pmic-wdt), so
+# a hang resets the frame instead of leaving it dead until a power cycle
+case " $(cat /proc/cmdline) " in
+  *" wdt "*) /bin/pmic-wdt 60 & ;;
+esac
+# The probe's output goes through /dev/kmsg, i.e. printk's polled console
+# writes, not the tty: the first SMP boot's output stopped mid-word, and the
+# kernel log is the path that has never failed us (printk.devkmsg=on lifts
+# its rate limit)
+case " $(cat /proc/cmdline) " in
+  *" probe "*|*" probe_reboot "*)
+    /bin/probe 2>&1 | while IFS= read -r l; do echo "$l" > /dev/kmsg; done ;;
+esac
+# `usbnet`: the USB gadget's usb0 at 192.168.7.2 with a root shell server on it.
+# A bring-up convenience -- no password, but the only thing at the other end
+# of a USB cable is the machine it is plugged into
+case " $(cat /proc/cmdline) " in
+  *" usbnet "*)
+    mkdir -p /dev/pts && mount -t devpts devpts /dev/pts
+    for i in 1 2 3 4 5; do ifconfig usb0 192.168.7.2 netmask 255.255.255.0 up 2>/dev/null && break; sleep 1; done
+    # Alpine's busybox-static has no telnetd (out-8, 2026-10-27); nc -lk -e
+    # is a persistent one-at-a-time shell server. No -i for the shell: an
+    # interactive sh spins on a closed socket. From the Mac, with no setup:
+    #   nc -6 fe80::<frame's usb0 EUI-64>%enN 23   (ping6 ff02::1%enN finds it)
+    nc -lk -p 23 -e /bin/sh &
+    echo "usbnet: shell on 192.168.7.2:23 (nc), and on usb0's IPv6 link-local" ;;
+esac
+# `cp2test`: start the WCN co-processor and check it answers over SIPC, the
+# first step towards Wi-Fi (docs/wifi.md, /bin/cp2test). Through /dev/kmsg
+# like the probe, and before probe_reboot so a test boot can end in a reboot
+case " $(cat /proc/cmdline) " in
+  *" cp2test "*)
+    /bin/cp2test 2>&1 | while IFS= read -r l; do echo "$l" > /dev/kmsg; done ;;
+esac
+# `hosttest`: the micro-USB port as a USB host (dwc2 role switched at
+# runtime, VBUS from the OTG boost), its bus listed for 90 s, then a reboot
+# (/bin/hosttest, docs/wifi.md). The USB network shell is gone in host mode
+case " $(cat /proc/cmdline) " in
+  *" hosttest "*)
+    /bin/hosttest 2>&1 | while IFS= read -r l; do echo "$l" > /dev/kmsg; done ;;
+esac
+# `wifitest`: the same, then a Wi-Fi dongle scanned and, with credentials
+# in the build, associated (/bin/wifitest; a `WIFI=1` build)
+case " $(cat /proc/cmdline) " in
+  *" wifitest "*)
+    /bin/wifitest 2>&1 | while IFS= read -r l; do echo "$l" > /dev/kmsg; done ;;
+esac
+# `idletest`: a heartbeat a second for 150 s with nothing else running, then
+# reboot. The hangs of 2026-10-27 came when the system went idle; this says
+# exactly when, under whatever idle options are on the command line
+case " $(cat /proc/cmdline) " in
+  *" idletest "*)
+    n=0
+    while [ $n -lt 150 ]; do
+      echo "idle: $n s, uptime $(cut -d' ' -f1 /proc/uptime)" > /dev/kmsg
+      sleep 1; n=$((n + 1))
+    done
+    echo "idle: survived" > /dev/kmsg; sleep 1; reboot -f ;;
+esac
+case " $(cat /proc/cmdline) " in
+  *" probe_reboot "*) echo "probe: rebooting" > /dev/kmsg; sleep 2; reboot -f ;;
+esac
+# Alpine's busybox-static has no cttyhack (out-5, 2026-10-27: "can't
+# execute 'cttyhack'", init exited, panic); a new session that opens the
+# console itself gets it as its controlling tty, which is all cttyhack did
+# On the UART only when the command line puts the console there (a debug
+# boot through tools/uboot-cmd.py): since 2026-10-29 the default boot leaves
+# uart1 to an ESP32-C3 BLE controller (docs/ble-c3.md), so the fallback
+# shell goes to the screen
+tty=/dev/tty1
+case " $(cat /proc/cmdline) " in *" console=ttyS1"*) tty=/dev/ttyS1 ;; esac
+exec setsid sh -c "exec sh -l <$tty >$tty 2>&1"

@@ -1,0 +1,46 @@
+#!/bin/sh
+# hosttest: the micro-USB port as a USB host, before any Wi-Fi (docs/wifi.md,
+# "USB dongle"). Switches dwc2's role to host -- which forces host mode and
+# turns on its vbus-supply, the OTG boost on GPIO 69 -- then lists what is on
+# the bus every 5 s for 90 s, for someone to plug the dongle in through an
+# OTG adapter meanwhile, and reboots. Every line starts with "host:" (the
+# init pipes it to /dev/kmsg, the UART). In host mode the USB network shell
+# is gone, so this reports over the UART only. Nothing here touches the eMMC.
+
+say() { echo "host: $*"; }
+
+sw=
+for r in /sys/class/usb_role/*/role; do [ -e "$r" ] && sw=$r; done
+[ -n "$sw" ] || { say "no usb_role switch, dwc2 didn't register one"; exit 1; }
+say "role switch $sw was $(cat "$sw")"
+echo host > "$sw" && say "role now $(cat "$sw")"
+
+# VBUS: the regulator's state and the GPIO's level as the kernel sees it
+vbus() {
+  for d in /sys/class/regulator/regulator.*; do
+    [ "$(cat "$d/name" 2>/dev/null)" = otg-vbus ] &&
+      say "otg-vbus regulator: $(cat "$d/state" 2>/dev/null), users $(cat "$d/num_users" 2>/dev/null)"
+  done
+  grep -h "gpio-581 \|otg-vbus\|GPIO69\b" /sys/kernel/debug/gpio 2>/dev/null | sed 's/^/host: gpio /'
+}
+mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null
+vbus
+
+n=0
+while [ $n -lt 90 ]; do
+  say "--- t=${n}s"
+  for d in /sys/bus/usb/devices/*; do
+    [ -f "$d/idVendor" ] || continue
+    say "$(basename "$d") $(cat "$d/idVendor"):$(cat "$d/idProduct") speed $(cat "$d/speed" 2>/dev/null) '$(cat "$d/manufacturer" 2>/dev/null) $(cat "$d/product" 2>/dev/null)' driver $(basename "$(readlink "$d"/*:1.0/driver 2>/dev/null)" 2>/dev/null)"
+  done
+  ls /sys/class/net | tr '\n' ' ' | sed 's/^/host: net /'; echo
+  [ $n -eq 10 ] && vbus
+  sleep 5
+  n=$((n + 5))
+done
+say "kernel log, usb/dwc2/regulator/firmware lines:"
+dmesg | grep -iE "dwc2|usb|vbus|regulator|firmware|wlan|80211" | tail -60 | sed 's/^/host: | /'
+vbus
+say "done, rebooting"
+sleep 2
+reboot -f

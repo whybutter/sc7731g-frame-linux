@@ -1,0 +1,30 @@
+#!/sbin/openrc-run
+# sc7731g-bt: the SC7731G's built-in Bluetooth as hci0 (docs/bluetooth.md).
+# The radio is a controller inside the SoC's WCN co-processor (cp2), shared
+# with the Wi-Fi. The kernel's bt-sc7731g driver is the HCI device, but cp2's
+# Bluetooth wants its PSKEY block before the first HCI command, and that is
+# built from the frame's own Android files (pskey.sh): this service builds it
+# and writes it to the driver's `pskey` attribute. The first write registers
+# hci0. BR/EDR only, no LE.
+description="sc7731g-bt: hand the Bluetooth PSKEY to bt-sc7731g"
+
+depend() {
+	need localmount
+	after udev-settle modules
+	before bluetooth
+}
+
+start() {
+	BT_WCN=1
+	[ -r /etc/conf.d/sc7731g ] && . /etc/conf.d/sc7731g
+	[ "$BT_WCN" = 1 ] || return 0
+	attr=
+	for d in /sys/bus/platform/drivers/bt-sc7731g/*; do
+		[ -f "$d/pskey" ] && { attr=$d/pskey; break; }
+	done
+	[ -n "$attr" ] || { eerror "no bt-sc7731g device (kernel without the driver?)"; return 1; }
+	ebegin "Handing the Bluetooth PSKEY to the kernel (bt-sc7731g)"
+	/usr/lib/sc7731g-bt/pskey.sh /run/sc7731g-bt/pskey.bin &&
+		cat /run/sc7731g-bt/pskey.bin > "$attr"
+	eend $?
+}

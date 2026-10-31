@@ -1,0 +1,16 @@
+state.VT10101 {
+	control.1 {
+		iface MIXER
+		name 'Speaker Playback Volume'
+		value 10
+		comment {
+			access 'read write'
+			type INTEGER
+			count 1
+			range '0 - 15'
+			dbmin -9999999
+			dbmax 900
+			dbvalue.0 -600
+		}
+	}
+}

@@ -1,0 +1,73 @@
+#!/sbin/openrc-run
+# sc7731g-bt-ext: BLE through an ESP32-C3 wired to the frame's uart1 pads as
+# an HCI-over-UART controller (docs/ble-c3.md; the C3 runs c3-hci). The
+# board's own Bluetooth (sc7731g-bt, the WCN) is BR/EDR only; this is the LE
+# adapter, side by side with it in BlueZ.
+#
+# Each start resets the C3 -- BT_EXT_RESET_GPIO (sysfs number; the IR-IN pad,
+# through a Schottky to the C3's EN) low for 100 ms, then back to an input --
+# and gives it BT_EXT_BOOT_MS to boot. The C3 then keeps its TX pin undriven
+# until the host's first HCI_Reset, which the kernel sends as soon as btattach
+# attaches: before that the frame's U-Boot shares the line, and one byte into
+# its RX at boot stops autoboot. btattach (H4, BT_EXT_BAUD, no flow control:
+# the pads have no RTS/CTS) runs under supervise-daemon; hciN comes and goes
+# with it. Which hciN is which isn't stable, so nothing should assume one:
+# the LE adapter is the one whose Adapter1 has Roles (the WCN's has none).
+#
+# It stays out while the kernel still has its console on the same UART
+# (console=ttyS1 in /proc/cmdline): until the C3 is soldered on, that UART is
+# the frame's console. BT_EXT=1 in /etc/conf.d/sc7731g turns it on.
+description="sc7731g-bt-ext: BLE through the ESP32-C3 on uart1 (btattach)"
+supervisor=supervise-daemon
+command=/usr/bin/btattach
+output_log=/var/log/sc7731g-bt-ext.log
+error_log=/var/log/sc7731g-bt-ext.log
+respawn_delay=5
+respawn_max=5
+respawn_period=600
+
+depend() {
+	need localmount
+	after udev-settle modules sc7731g-bt
+	before bluetooth
+}
+
+load_board() {
+	BT_EXT= BT_EXT_UART=/dev/ttyS1 BT_EXT_BAUD=1000000 BT_EXT_RESET_GPIO= BT_EXT_BOOT_MS=400
+	[ -r /etc/conf.d/sc7731g ] && . /etc/conf.d/sc7731g
+	[ "$BT_EXT" = 1 ]
+}
+
+# sysfs GPIO
+reset_c3() {
+	g=$BT_EXT_RESET_GPIO
+	[ -n "$g" ] || return 0
+	d=/sys/class/gpio/gpio$g
+	[ -d $d ] || echo $g > /sys/class/gpio/export 2>/dev/null
+	[ -d $d ] || { ewarn "no gpio$g: the C3 starts without a reset"; return 0; }
+	echo low > $d/direction        # output, driven low: EN pulled through the diode
+	sleep 0.1
+	echo in > $d/direction         # released: the C3's own pull-up lifts EN
+	ms=$BT_EXT_BOOT_MS
+	sleep $((ms / 1000)).$(printf %03d $((ms % 1000)))
+}
+
+start() {
+	load_board || return 0
+	case " $(cat /proc/cmdline) " in
+	*" console=${BT_EXT_UART#/dev/},"*|*" console=${BT_EXT_UART#/dev/} "*)
+		ewarn "sc7731g-bt-ext: the kernel console is still on $BT_EXT_UART; staying out"
+		return 0 ;;
+	esac
+	[ -c "$BT_EXT_UART" ] || { eerror "no $BT_EXT_UART"; return 1; }
+	ebegin "Resetting the BLE controller (ESP32-C3)"
+	reset_c3
+	eend 0
+	command_args="-B $BT_EXT_UART -P h4 -S $BT_EXT_BAUD"
+	default_start
+}
+
+stop() {
+	load_board || return 0
+	default_stop
+}

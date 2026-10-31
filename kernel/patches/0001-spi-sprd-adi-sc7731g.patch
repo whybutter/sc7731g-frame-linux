@@ -1,0 +1,163 @@
+From: sc7731g-frame-linux contributors
+Subject: [PATCH] spi: sprd-adi: support the SC7731G (SC8830-generation) controller
+
+The SC7731G's ADI is the older controller: RD_CMD, RD_DATA and the FIFO
+status are at 0x24/0x28/0x2c (not 0x28/0x2c/0x30), the read command takes
+the register's physical address, and its PMIC is the SC2713S, whose
+watchdog (0x40) and global registers (0x800) are not where the SC2731's
+are. Layout and offsets from Samsung's SM-G531H GPL kernel
+(drivers/platform/sprd/adi.c, sys_reset.h, chip_x30g/).
+
+Gives the frame a restart handler (the PMIC watchdog, as the vendor kernel
+resets) and register access to the PMIC for the regulator driver to come.
+
+---
+--- a/drivers/spi/spi-sprd-adi.c	2026-10-24 12:34:17
++++ b/drivers/spi/spi-sprd-adi.c	2026-10-24 12:35:05
+@@ -29,6 +29,15 @@
+ #define REG_ADI_RD_CMD			0x28
+ #define REG_ADI_RD_DATA			0x2c
+ #define REG_ADI_ARM_FIFO_STS		0x30
++
++/*
++ * The SC8830 generation (SC7731G) has the older controller: the read
++ * command, read data and FIFO status registers sit one word lower, and the
++ * read command takes the slave register's physical address.
++ */
++#define REG_ADI_R1_RD_CMD		0x24
++#define REG_ADI_R1_RD_DATA		0x28
++#define REG_ADI_R1_ARM_FIFO_STS		0x2c
+ #define REG_ADI_STS			0x34
+ #define REG_ADI_EVT_FIFO_STS		0x38
+ #define REG_ADI_ARM_CMD_STS		0x3c
+@@ -137,6 +146,7 @@
+ struct sprd_adi_data {
+ 	u32 slave_offset;
+ 	u32 slave_addr_size;
++	bool r1;	/* SC8830-generation register layout, see REG_ADI_R1_* */
+ 	int (*read_check)(u32 val, u32 reg);
+ 	int (*restart)(struct sys_off_data *data);
+ 	void (*wdg_rst)(void *p);
+@@ -150,6 +160,9 @@
+ 	unsigned long		slave_vbase;
+ 	unsigned long		slave_pbase;
+ 	const struct sprd_adi_data *data;
++	u32			rd_cmd;
++	u32			rd_data;
++	u32			fifo_sts;
+ };
+ 
+ static int sprd_adi_check_addr(struct sprd_adi *sadi, u32 reg)
+@@ -170,7 +183,7 @@
+ 	u32 sts;
+ 
+ 	do {
+-		sts = readl_relaxed(sadi->base + REG_ADI_ARM_FIFO_STS);
++		sts = readl_relaxed(sadi->base + sadi->fifo_sts);
+ 		if (sts & BIT_FIFO_EMPTY)
+ 			break;
+ 
+@@ -187,7 +200,7 @@
+ 
+ static int sprd_adi_fifo_is_full(struct sprd_adi *sadi)
+ {
+-	return readl_relaxed(sadi->base + REG_ADI_ARM_FIFO_STS) & BIT_FIFO_FULL;
++	return readl_relaxed(sadi->base + sadi->fifo_sts) & BIT_FIFO_FULL;
+ }
+ 
+ static int sprd_adi_read_check(u32 val, u32 addr)
+@@ -239,7 +252,8 @@
+ 	 * Set the slave address offset need to read into RD_CMD register,
+ 	 * then ADI controller will start to transfer automatically.
+ 	 */
+-	writel_relaxed(reg, sadi->base + REG_ADI_RD_CMD);
++	writel_relaxed(sadi->data->r1 ? sadi->slave_pbase + reg : reg,
++		       sadi->base + sadi->rd_cmd);
+ 
+ 	/*
+ 	 * Wait read operation complete, the BIT_RD_CMD_BUSY will be set
+@@ -248,7 +262,7 @@
+ 	 * completed.
+ 	 */
+ 	do {
+-		val = readl_relaxed(sadi->base + REG_ADI_RD_DATA);
++		val = readl_relaxed(sadi->base + sadi->rd_data);
+ 		if (!(val & BIT_RD_CMD_BUSY))
+ 			break;
+ 
+@@ -456,6 +470,22 @@
+ 	return sprd_adi_restart(data->cb_data, data->mode, data->cmd, &wdg);
+ }
+ 
++/*
++ * SC2713S on the SC7731G: watchdog at 0x40, the global registers at 0x800
++ * (Samsung SM-G531H source, include/soc/sprd/chip_x30g and sys_reset.h).
++ */
++static int sprd_adi_restart_sc7731g(struct sys_off_data *data)
++{
++	struct sprd_adi_wdg wdg = {
++		.base = 0x40,
++		.rst_sts = 0x800 + 0xe8,	/* ANA_REG_GLB_POR_RST_MONITOR */
++		.wdg_en = 0x800 + 0x0,		/* ANA_REG_GLB_ARM_MODULE_EN */
++		.wdg_clk = 0x800 + 0x8,		/* ANA_REG_GLB_RTC_CLK_EN */
++	};
++
++	return sprd_adi_restart(data->cb_data, data->mode, data->cmd, &wdg);
++}
++
+ static void sprd_adi_hw_init(struct sprd_adi *sadi)
+ {
+ 	struct device_node *np = sadi->dev->of_node;
+@@ -567,8 +597,21 @@
+ 		}
+ 	}
+ 
+-	sprd_adi_hw_init(sadi);
++	if (data->r1) {
++		sadi->rd_cmd = REG_ADI_R1_RD_CMD;
++		sadi->rd_data = REG_ADI_R1_RD_DATA;
++		sadi->fifo_sts = REG_ADI_R1_ARM_FIFO_STS;
++	} else {
++		sadi->rd_cmd = REG_ADI_RD_CMD;
++		sadi->rd_data = REG_ADI_RD_DATA;
++		sadi->fifo_sts = REG_ADI_ARM_FIFO_STS;
++	}
+ 
++	/* the r1 controller's priority and GSSI registers are elsewhere too;
++	 * the boot loader has configured it, so leave it as it is */
++	if (!data->r1)
++		sprd_adi_hw_init(sadi);
++
+ 	if (sadi->data->wdg_rst)
+ 		sadi->data->wdg_rst(sadi);
+ 
+@@ -602,6 +645,18 @@
+ 	.wdg_rst = sprd_adi_set_wdt_rst_mode,
+ };
+ 
++/*
++ * No read check: the readback address width depends on the controller
++ * version (the vendor driver derives it from GSSI_CFG0); reads still wait
++ * for the busy bit.
++ */
++static struct sprd_adi_data sc7731g_data = {
++	.slave_offset = ADI_10BIT_SLAVE_OFFSET,
++	.slave_addr_size = ADI_10BIT_SLAVE_ADDR_SIZE,
++	.r1 = true,
++	.restart = sprd_adi_restart_sc7731g,
++};
++
+ static struct sprd_adi_data sc9863_data = {
+ 	.slave_offset = ADI_12BIT_SLAVE_OFFSET,
+ 	.slave_addr_size = ADI_12BIT_SLAVE_ADDR_SIZE,
+@@ -616,6 +671,10 @@
+ 
+ static const struct of_device_id sprd_adi_of_match[] = {
+ 	{
++		.compatible = "sprd,sc7731g-adi",
++		.data = &sc7731g_data,
++	},
++	{
+ 		.compatible = "sprd,sc9860-adi",
+ 		.data = &sc9860_data,
+ 	},

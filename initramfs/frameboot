@@ -1,0 +1,133 @@
+#!/bin/sh
+# frameboot: boot the A/B root slots from the eMMC (docs/install-plan.md,
+# Phase 4). Run by /init when the command line has `frameboot`.
+#
+# On the A33 frames a U-Boot script does this (vphoto-frame-linux's
+# uboot/boot.cmd); the vendor U-Boot here can't run our scripts, so it moves into the initramfs, step for step:
+#   - fl-boot (the FRAMEBOOT FAT) holds update/slot.env (slot=a|b, the
+#     committed slot) and, while an update is on trial, update/trial.env
+#     (try=<slot> tries=<n>). The count is written back BEFORE the trial root
+#     is used, so a trial that never reaches userspace is still counted; the
+#     third pass boots the committed slot. The userland commits a healthy
+#     trial (deletes trial.env, writes slot.env) or clears a failed one.
+#   - the FAT hook: frame-fix.sh on fl-boot runs inside the chosen root with
+#     the FAT at /boot, before its init (the A33's init=/bin/sh -c "...").
+#   - frame.slot= / frame.trial= / root= are what the A33 frames' userspace
+#     reads from /proc/cmdline (its updater, diagnostics, the console). This kernel's command line is fixed by the time we
+#     run (the DT's bootargs plus what cboot appends), so the new root gets
+#     a /proc already mounted with a completed cmdline bound over
+#     /proc/cmdline. Its init finds /proc mounted and leaves it.
+# Partitions are found by GPT name (tools/gpt-split.py made them), slots by
+# their fixed GUIDs for root=.
+# Anything that fails drops to the initramfs shell on the console instead of
+# a dead frame: /init sources this file and calls frameboot (switch_root has
+# to run as PID 1), so failures return rather than exit -- an exiting PID 1
+# is a panic.
+
+say() { echo "frameboot: $*"; echo "frameboot: $*" > /dev/kmsg 2>/dev/null; }
+
+part() {	# GPT name -> /dev node
+  for u in /sys/class/block/*/uevent; do
+    grep -qx "PARTNAME=$1" "$u" 2>/dev/null &&
+      { echo /dev/$(sed -n 's/^DEVNAME=//p' "$u"); return 0; }
+  done
+  return 1
+}
+
+frameboot() {
+FB=$(part fl-boot) || { say "no fl-boot partition"; return 1; }
+mkdir -p /fb /newroot
+mount -t vfat "$FB" /fb || { say "can't mount fl-boot ($FB)"; return 1; }
+
+# the way to the initramfs shell while frameboot is the default boot:
+# FRAMEBOOT/noframeboot (create it from the running system over SSH, or by mounting
+# FRAMEBOOT anywhere) makes the next boots stop here, for debugging
+if [ -e /fb/noframeboot ]; then
+  umount /fb; say "FRAMEBOOT/noframeboot: staying in the initramfs"; return 1
+fi
+
+slot=a
+[ -f /fb/update/slot.env ] && . /fb/update/slot.env 2>/dev/null
+[ "$slot" = b ] || slot=a
+boot=$slot trial=0
+if [ -f /fb/update/trial.env ]; then
+  try= tries=0
+  . /fb/update/trial.env 2>/dev/null
+  case "$try" in a|b)
+    tries=$((tries + 1))
+    printf 'try=%s\ntries=%s\n' "$try" "$tries" > /fb/update/trial.env
+    sync
+    [ "$tries" -le 2 ] && boot=$try trial=1 ;;
+  esac
+fi
+
+for s in $boot $slot; do
+  [ "$s" = b ] && n=26 || n=25
+  dev=$(part fl-$s) || continue
+  if mount -t ext4 -o rw "$dev" /newroot 2>/dev/null; then
+    [ -x /newroot/sbin/init ] && { boot=$s; break; }
+    umount /newroot
+  fi
+  say "slot $s unusable"
+  trial=0
+done
+mountpoint -q /newroot || { umount /fb; say "no bootable slot"; return 1; }
+say "slot $boot (committed $slot, trial $trial)"
+
+# the FAT hook, inside the new root
+mkdir -p /newroot/boot
+mount --bind /fb /newroot/boot
+if [ -f /newroot/boot/frame-fix.sh ]; then
+  say "running frame-fix.sh"
+  chroot /newroot /bin/sh /boot/frame-fix.sh || say "frame-fix.sh failed"
+fi
+umount /newroot/boot
+# FRAMEBOOT/wifi-mac: this unit's Wi-Fi MAC, when it has to keep a particular
+# one (the kernel derives a stable one from the serial otherwise). Here and
+# not in the root: an A/B update replaces the root, this travels with the
+# kernel, and the driver only takes an address while the interface is down
+if [ -r /fb/wifi-mac ]; then
+  ifconfig wlan0 hw ether "$(cat /fb/wifi-mac)" || say "wlan0: bad wifi-mac"
+fi
+umount /fb
+
+# /etc/frame-slot.env, for a userland slot helper that reads it before
+# falling back to /proc/cmdline; board=vt10101 tells an updater the kernel
+# isn't per slot here (it lives in the boot partition), so it writes only
+# the rootfs
+printf 'slot=%s\ntrial=%s\nboard=vt10101\n' "$boot" "$trial" > /newroot/etc/frame-slot.env
+
+# /lib/modules/<release>: this kernel's built-in list (build/kernel.sh says
+# why), on a small tmpfs over the root's /lib/modules -- the slot's own
+# entries belong to the A33's kernel, and an update replaces the slot anyway
+r=$(uname -r)
+if [ -d /lib/modules/$r ] && [ ! -d /newroot/lib/modules/$r ]; then
+  mkdir -p /newroot/lib/modules
+  mount -t tmpfs -o size=4m,mode=755 modules /newroot/lib/modules &&
+    cp -a /lib/modules/$r /newroot/lib/modules/ || say "no /lib/modules/$r"
+fi
+
+# the command line the A33 userland expects (until every reader uses a
+# slot helper)
+guid=$(printf '5654544d-0000-4000-8000-%012x' $n)
+# (on the root's own /run, under the tmpfs its init mounts there: the bind
+# below holds the file, whatever later covers the directory)
+mkdir -p /newroot/run
+echo "root=PARTUUID=$guid $(cat /proc/cmdline) frame.slot=$boot frame.trial=$trial" \
+  > /newroot/run/frame-cmdline
+mount --move /proc /newroot/proc
+mount --bind /newroot/run/frame-cmdline /newroot/proc/cmdline
+mount --move /sys /newroot/sys
+mount --move /dev /newroot/dev
+
+# usb0 opened here, not left to the userland: its networking opened usb0
+# ~30 s in (it waited for a wlan0 this board then lacked), and host traffic that
+# arrives at an enumerated gadget whose usb0 isn't open yet wedges dwc2's
+# ep1out -- RX stops for good after a few packets, TX goes on, so the host
+# never got a lease (2026-10-27; DOEPCTL.EPDisable timed out on a soft
+# reconnect, after which it worked). Up from here it never wedged. The
+# userland's ifup only adds the address to an interface that is already up.
+ifconfig usb0 up 2>/dev/null || say "usb0 not up"
+
+exec switch_root /newroot /sbin/init
+}

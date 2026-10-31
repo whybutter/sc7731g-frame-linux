@@ -1,0 +1,51 @@
+--- a/drivers/dma/sprd-dma.c	2026-10-29 08:11:29
++++ b/drivers/dma/sprd-dma.c	2026-10-29 08:11:29
+@@ -213,6 +213,7 @@
+ struct sprd_dma_variant {
+ 	u32 pause_sts;		/* the CHN_PAUSE bit that says it paused */
+ 	u32 int_sts_shift;	/* where CHN_INTC's five status bits start */
++	bool int_sts_raw;	/* they latch every event, enabled or not */
+ 	u32 first_slave_chn;	/* lower channels lack TRSC_LEN and link lists */
+ 	bool no_pending;	/* no REQ_PEND*_EN writes */
+ 	bool no_wait_bdone;	/* leave CFG bit 24 (DONOT_WAIT_BDONE) clear */
+@@ -229,12 +230,18 @@
+  * pause status is bit 16; channels 0-23 are "standard" (registers only to
+  * 0x1c), so device requests go to 24-31; the vendor never writes the
+  * REQ_PEND registers or CFG bit 24, and only knows widths of 1, 2 and 4
+- * bytes. Its INTC status bits are taken from the sibling sharkl64 driver
+- * (8-12); the r4p0 driver never reads them (docs/audio.md).
++ * bytes. Its INTC status bits are at 8-12, as the sibling sharkl64
++ * driver has them (the r4p0 driver never reads them), and they are raw:
++ * a playing audio channel read INTC = 0x314 -- fragment and block done
++ * latched (bits 8, 9) with only the transaction interrupt enabled (bit 2),
++ * so the status has to be masked by the enables before it says which
++ * interrupt fired (VT10101, 2026-10-29: unmasked, every period logged
++ * "incorrect dma interrupt type").
+  */
+ static const struct sprd_dma_variant sc7731g_dma = {
+ 	.pause_sts = BIT(16),
+ 	.int_sts_shift = 8,
++	.int_sts_raw = true,
+ 	.first_slave_chn = 24,
+ 	.no_pending = true,
+ 	.no_wait_bdone = true,
+@@ -437,10 +444,16 @@
+ static enum sprd_dma_int_type sprd_dma_get_int_type(struct sprd_dma_chn *schan)
+ {
+ 	struct sprd_dma_dev *sdev = to_sprd_dma_dev(&schan->vc.chan);
+-	/* the status bits as SC9860 places them, from wherever this SoC does */
+-	u32 intc_sts = ((readl(schan->chn_base + SPRD_DMA_CHN_INTC) >>
+-			 sdev->var->int_sts_shift) << 16) & SPRD_DMA_CHN_INT_STS;
++	/* the status bits as SC9860 places them, from wherever this SoC does,
++	 * and only those of enabled interrupts where they latch every event */
++	u32 intc = readl(schan->chn_base + SPRD_DMA_CHN_INTC);
++	u32 sts = intc >> sdev->var->int_sts_shift;
++	u32 intc_sts;
+ 
++	if (sdev->var->int_sts_raw)
++		sts &= intc;	/* enables FRAG..CFGERR are bits 0-4 */
++	intc_sts = (sts << 16) & SPRD_DMA_CHN_INT_STS;
++
+ 	switch (intc_sts) {
+ 	case SPRD_DMA_CFGERR_INT_STS:
+ 		return SPRD_DMA_CFGERR_INT;

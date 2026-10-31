@@ -1,0 +1,14 @@
+out/
+out-*/
+# vendor firmware, extracted from your own frame (firmware/extract.sh): never committed
+firmware/*
+!firmware/extract.sh
+!firmware/SHA256SUMS
+!firmware/README.md
+!firmware/patches/
+__pycache__/
+*.img
+*.ko
+backup/
+# maintainers' private scrub terms (tools/scrub-check.sh)
+tools/scrub-private.txt

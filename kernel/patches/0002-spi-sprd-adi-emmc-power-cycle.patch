@@ -1,0 +1,45 @@
+From: sc7731g-frame-linux contributors
+Subject: [PATCH] spi: sprd-adi: power-cycle the eMMC before an SC7731G restart
+
+A warm reset after Linux read data from the eMMC left the boot ROM unable
+to read the card until a power cycle; the reset handler now cuts and
+restores the card's two PMIC supplies first. See the comment.
+
+---
+--- a/drivers/spi/spi-sprd-adi.c	2026-10-27 16:46:40
++++ b/drivers/spi/spi-sprd-adi.c	2026-10-27 16:46:40
+@@ -482,7 +482,34 @@
+ 		.wdg_en = 0x800 + 0x0,		/* ANA_REG_GLB_ARM_MODULE_EN */
+ 		.wdg_clk = 0x800 + 0x8,		/* ANA_REG_GLB_RTC_CLK_EN */
+ 	};
++	struct sprd_adi *sadi = data->cb_data;
++	u32 v;
+ 
++	/*
++	 * Power-cycle the eMMC before the reset. A warm reset after Linux had
++	 * read data from the card left the boot ROM unable to read it ("MCI
++	 * ERF" twice on the UART, then nothing until a power cycle) -- three
++	 * times by 2026-10-27, while resets after only the partition scan came
++	 * back. The cause was never found, and pulsing the controller's eMMC
++	 * reset bit (SOFTWARE_RESET bit 3) didn't reset the card (a read right
++	 * after it still worked). What a power cycle fixes, cutting the card's
++	 * supplies fixes too: vddemmccore (VCC, LDO bit 8) and vddemmcio (VCCQ,
++	 * bit 7), the vendor DT's LDO_DCDC_PD_RTCSET 0x810 / RTCCLR 0x814 pair
++	 * (set = off, clear = on, clear wins). Off, 50 ms for the card to
++	 * drain, back on and 20 ms to settle before the watchdog fires, so the
++	 * boot ROM finds a card fresh from power-up and the LDOs on.
++	 */
++	sprd_adi_read(sadi, 0x814, &v);
++	sprd_adi_write(sadi, 0x814, v & ~0x180);
++	sprd_adi_read(sadi, 0x810, &v);
++	sprd_adi_write(sadi, 0x810, v | 0x180);
++	mdelay(50);
++	sprd_adi_read(sadi, 0x810, &v);
++	sprd_adi_write(sadi, 0x810, v & ~0x180);
++	sprd_adi_read(sadi, 0x814, &v);
++	sprd_adi_write(sadi, 0x814, v | 0x180);
++	mdelay(20);
++
+ 	return sprd_adi_restart(data->cb_data, data->mode, data->cmd, &wdg);
+ }
+ 

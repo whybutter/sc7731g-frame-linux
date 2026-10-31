@@ -1,0 +1,82 @@
+#!/bin/sh
+# wifitest: Wi-Fi through a USB dongle on the micro-USB port (docs/wifi.md),
+# in a `WIFI=1` build (kernel/wifi.config, wpa_supplicant/iw from Alpine).
+# Switches dwc2 to host (VBUS on), waits up to 90 s for a wireless
+# interface (plug the dongle in meanwhile), scans, and -- if the
+# FRAMEBOOT FAT (fl-boot) has a wpa_supplicant.conf -- associates and asks
+# DHCP for an address. Then reboots. Every line starts with "wifi:" (UART,
+# via /dev/kmsg); the credentials are never printed.
+#
+# The credentials are the same file the userland reads at /boot, so no
+# image carries them. The FAT is mounted read-only: nothing here writes
+# to the eMMC.
+
+say() { echo "wifi: $*"; }
+# iw indents with tabs, which some UART viewers drop (wifitest1): spaces
+log() { tr '\t' ' ' | sed 's/^/wifi: | /'; }
+finish() {
+  say "kernel log, usb/wlan/firmware lines:"
+  dmesg | grep -iE "usb|wlan|80211|firmware|rtl8xxxu|carl9170|ath9k|mt7601u|rt2800" | tail -60 | log
+  say "done, rebooting"
+  sleep 2
+  reboot -f
+}
+
+for r in /sys/class/usb_role/*/role; do [ -e "$r" ] && sw=$r; done
+[ -n "$sw" ] || { say "no usb_role switch"; finish; }
+echo host > "$sw" && say "usb role now $(cat "$sw")"
+
+wl=
+n=0
+while [ -z "$wl" ] && [ $n -lt 90 ]; do
+  for d in /sys/class/net/*; do [ -d "$d/wireless" ] && wl=$(basename "$d"); done
+  [ -n "$wl" ] && break
+  [ $((n % 10)) -eq 0 ] && for d in /sys/bus/usb/devices/*; do
+    [ -f "$d/idVendor" ] && say "t=${n}s usb $(cat "$d/idVendor"):$(cat "$d/idProduct") '$(cat "$d/product" 2>/dev/null)'"
+  done
+  sleep 2; n=$((n + 2))
+done
+[ -n "$wl" ] || { say "no wireless interface after 90 s"; finish; }
+say "interface $wl, driver $(basename "$(readlink /sys/class/net/$wl/device/driver)")"
+iw dev 2>&1 | log
+ip link set "$wl" up 2>&1 | log
+
+say "scanning"
+iw dev "$wl" scan 2>&1 |
+  awk '/^BSS /{b=substr($2, 1, 17)} /signal:/{s=$2" "$3} /^\tSSID:/{sub(/^\tSSID: /,""); printf "%s %s %s\n", b, s, $0}' |
+  log
+
+fb=
+for u in /sys/class/block/mmcblk*p*/uevent; do
+  grep -qx 'PARTNAME=fl-boot' "$u" 2>/dev/null && fb=/dev/$(sed -n 's/^DEVNAME=//p' "$u")
+done
+conf=/fb/wpa_supplicant.conf
+mkdir -p /fb
+if [ -n "$fb" ] && mount -t vfat -o ro "$fb" /fb; then
+  say "FRAMEBOOT ($fb) mounted read-only"
+else
+  say "no FRAMEBOOT to read credentials from (${fb:-no fl-boot partition})"
+fi
+if [ -f "$conf" ]; then
+  say "associating (credentials from FRAMEBOOT/wpa_supplicant.conf)"
+  # the userland's conf may name a ctrl_interface under /var/run
+  mkdir -p /var/run /run
+  wpa_supplicant -B -D nl80211 -i "$wl" -c "$conf" 2>&1 | log
+  n=0
+  while [ $n -lt 30 ] && ! iw dev "$wl" link | grep -q '^Connected'; do sleep 1; n=$((n + 1)); done
+  iw dev "$wl" link 2>&1 | grep -v -i "psk\|key" | log
+  if iw dev "$wl" link | grep -q '^Connected'; then
+    say "associated after ${n}s, asking DHCP"
+    udhcpc -i "$wl" -n -q -t 10 -s /bin/udhcpc-script 2>&1 | log
+    ip -4 addr show "$wl" 2>&1 | log
+    ip route 2>&1 | log
+    gw=$(ip route | awk '/^default/{print $3; exit}')
+    [ -n "$gw" ] && { say "ping gateway $gw"; ping -c 3 -W 2 "$gw" 2>&1 | log; }
+  else
+    say "not associated after 30 s"
+  fi
+else
+  say "no FRAMEBOOT/wpa_supplicant.conf, scan only"
+fi
+mountpoint -q /fb && umount /fb
+finish

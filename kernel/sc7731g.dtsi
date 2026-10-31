@@ -1,0 +1,442 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * Spreadtrum SC7731G (SC8830 family, "scx30g"): 4x Cortex-A7, Mali-400 MP2.
+ *
+ * Addresses, interrupts and bits come from the vendor's own device tree (cut
+ * out of the VT10101's boot partition, dt.img) and the Samsung SM-G531H GPL
+ * kernel (3.10.65, the same SoC). Only what mainline can drive today is here;
+ * every block is added when it has a driver that has been seen working.
+ */
+
+#include <dt-bindings/interrupt-controller/arm-gic.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+
+#include "sc7731g-clocks.dtsi"
+
+/ {
+	#address-cells = <1>;
+	#size-cells = <1>;
+	interrupt-parent = <&gic>;
+
+	cpus {
+		#address-cells = <1>;
+		#size-cells = <0>;
+		/* the boot ROM's holding pen (kernel/mach-sprd/platsmp.c) */
+		enable-method = "sprd,sc7731g-smp";
+
+		cpu0: cpu@f00 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a7";
+			reg = <0xf00>;
+		};
+
+		cpu1: cpu@f01 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a7";
+			reg = <0xf01>;
+		};
+
+		cpu2: cpu@f02 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a7";
+			reg = <0xf02>;
+		};
+
+		cpu3: cpu@f03 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a7";
+			reg = <0xf03>;
+		};
+	};
+
+	/* clk_emmc as U-Boot leaves it: muxed to the 384 MHz PLL output
+	 * (vendor DT base_clk) and gated on. The real clk_emmc is in
+	 * sc7731g-clocks.dtsi; the eMMC moves to it once a probe boot has shown
+	 * the clock tree reads back the same rates. */
+	clk_emmc_fixed: clock-emmc-fixed {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <384000000>;
+		clock-output-names = "clk-emmc-fixed";
+	};
+
+	pmu {
+		compatible = "arm,cortex-a7-pmu";
+		interrupts = <GIC_SPI 92 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 93 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 94 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 95 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-affinity = <&cpu0>, <&cpu1>, <&cpu2>, <&cpu3>;
+	};
+
+	soc {
+		compatible = "simple-bus";
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		gic: interrupt-controller@12001000 {
+			compatible = "arm,cortex-a7-gic";
+			reg = <0x12001000 0x1000>, <0x12002000 0x2000>;
+			#interrupt-cells = <3>;
+			#address-cells = <0>;
+			interrupt-controller;
+		};
+
+		/* AP-side bus/reset control: the boot ROM's holding pen for
+		 * cores 1-3 and their resets (platsmp.c) */
+		ap_ahb: syscon@20d00000 {
+			compatible = "sprd,sc7731g-ap-ahb", "syscon";
+			reg = <0x20d00000 0x10000>;
+		};
+
+		/* power domains, among them each Cortex-A7 core's */
+		pmu_apb: syscon@402b0000 {
+			compatible = "sprd,sc7731g-pmu-apb", "syscon";
+			reg = <0x402b0000 0x10000>;
+		};
+
+		/* AP-side APB control: peripheral gates, the USB PHY tune */
+		ap_apb: syscon@71300000 {
+			compatible = "sprd,sc7731g-ap-apb", "syscon";
+			reg = <0x71300000 0x10000>;
+		};
+
+		/* the timers' clock gates, among much else */
+		aon_apb: syscon@402e0000 {
+			compatible = "sprd,sc7731g-aon-apb", "syscon";
+			reg = <0x402e0000 0x10000>;
+		};
+
+		/* the AP DMA controller: mainline's sprd-dma with patch 0003's
+		 * SC7731G variant (docs/audio.md); 32 channels,
+		 * devices only on 24-31 */
+		ap_dma: dma-controller@20100000 {
+			compatible = "sprd,sc7731g-dma";
+			reg = <0x20100000 0x4000>;
+			interrupts = <GIC_SPI 50 IRQ_TYPE_LEVEL_HIGH>;
+			#dma-cells = <1>;
+			dma-channels = <32>;
+			clocks = <&clk_dma>;
+			clock-names = "enable";
+		};
+
+		/* the VBC (r2p0): the DAC FIFOs the codec plays from
+		 * (sc7731g-vbc.c) */
+		vbc: audio-controller@40020000 {
+			compatible = "sprd,sc7731g-vbc";
+			reg = <0x40020000 0x10000>;
+			clocks = <&clk_vbc>;
+			sprd,syscon-aon = <&aon_apb>;
+			sprd,syscon-pmu = <&pmu_apb>;
+			#sound-dai-cells = <0>;
+			status = "disabled";
+		};
+
+		/* mainline's sprd-pcm-dma: the DMA side of the VBC's PCM; DA0's
+		 * request is 29 (the vendor's DMA_VB_DA0 on SCX30G) */
+		vbc_pcm: pcm-platform {
+			compatible = "sprd,pcm-platform";
+			dmas = <&ap_dma 29>;
+			dma-names = "da0";
+			#sound-dai-cells = <0>;
+			status = "disabled";
+		};
+
+		/* the bus to the SC2713S PMIC (its registers from 0x40038000) */
+		adi_bus: spi@40030000 {
+			compatible = "sprd,sc7731g-adi";
+			reg = <0x40030000 0x10000>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			/* sprd-adi counts its children as chip selects and
+			 * refuses to register a bus with none -- the first ADI
+			 * boot failed with -EINVAL for want of this node, and
+			 * with it went the restart handler. Its driver is
+			 * regulator-sc2713s.c */
+			pmic: pmic@0 {
+				compatible = "sprd,sc2713s";
+				reg = <0>;
+
+				/* from the vendor DT's sprd-regulators node, offsets
+				 * from 0x40038000; only the LDOs a driver of ours
+				 * uses, see regulator-sc2713s.c for why */
+				regulators {
+					/* the touch controller's supply */
+					vdd28: vdd28 {
+						regulator-name = "vdd28";
+						regulator-min-microvolt = <1800000>;
+						regulator-max-microvolt = <3000000>;
+						sprd,pd-set = <0x810 0x4>;
+						sprd,pd-clr = <0x814 0x4>;
+						sprd,vsel = <0x820 0xc>;
+						sprd,voltages = <2800000 3000000 2650000 1800000>;
+					};
+
+					/* the SIM2 pad group's I/O supply. On this board
+					 * the touch controller's reset (GPIO 81, pad
+					 * SIMCLK2) and interrupt (GPIO 82, pad SIMDA2)
+					 * are SIM2 pads; with this LDO off (U-Boot leaves
+					 * LDO_PD_CTRL bit 4 set) neither moves, and the
+					 * chip sits in reset -- out-4..8's -ENXIO. Found
+					 * 2026-10-27 by mapping pads to GPIOs on the live
+					 * frame (pull flips, GPIO = pad offset / 4 - 3 in
+					 * that stretch); switching it on by hand got chip
+					 * ID 0xb4820000 back. 1.8 V, as under Android */
+					vddsim2: vddsim2 {
+						regulator-name = "vddsim2";
+						regulator-min-microvolt = <1800000>;
+						regulator-max-microvolt = <3000000>;
+						sprd,pd-set = <0x81c 0x10>;
+						sprd,vsel = <0x824 0x300>;
+						sprd,voltages = <2800000 3000000 2500000 1800000>;
+					};
+
+					/* the USB PHY's: LDO_PD_CTRL bit 9, no clear bit */
+					vddusb: vddusb {
+						regulator-name = "vddusb";
+						regulator-min-microvolt = <3100000>;
+						regulator-max-microvolt = <3400000>;
+						sprd,pd-set = <0x81c 0x200>;
+						sprd,vsel = <0x828 0x300>;
+						sprd,voltages = <3300000 3400000 3200000 3100000>;
+					};
+				};
+			};
+		};
+
+		/* the display controller; DSI (0x21800000, a Synopsys
+		 * DW MIPI-DSI 1.21) has no driver yet, so this node only
+		 * takes over what U-Boot lit (sprd-sc7731g-dispc.c) */
+		dispc: display-controller@20800000 {
+			compatible = "sprd,sc7731g-dispc";
+			reg = <0x20800000 0x1000>;
+			interrupts = <GIC_SPI 46 IRQ_TYPE_LEVEL_HIGH>;
+			status = "disabled";
+		};
+
+		/* Mali-400 MP2 (GP + 2 PP), one interrupt line for all its
+		 * units. 256 MHz is the vendor's freq-default; it lists up to
+		 * 460.8 */
+		gpu: gpu@60000000 {
+			compatible = "sprd,sc7731g-mali", "arm,mali-400";
+			reg = <0x60000000 0x10000>;
+			interrupts = <GIC_SPI 39 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 39 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 39 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 39 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 39 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 39 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 39 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "gp", "gpmmu", "pp0", "ppmmu0",
+					  "pp1", "ppmmu1", "pmu";
+			clocks = <&clk_gpu_axi>, <&clk_gpu>;
+			clock-names = "bus", "core";
+			assigned-clocks = <&clk_gpu>;
+			assigned-clock-parents = <&clk_256m_gpu_gate>;
+			status = "disabled";
+		};
+
+		/* switches in the global blocks, thrown the vendor's way
+		 * (phy-sprd-sc7731g-usb.c) */
+		usb_phy: usb-phy {
+			compatible = "sprd,sc7731g-usb-phy";
+			sprd,aon-apb = <&aon_apb>;
+			sprd,ap-ahb = <&ap_ahb>;
+			sprd,ap-apb = <&ap_apb>;
+			#phy-cells = <0>;
+			status = "disabled";
+		};
+
+		/* Synopsys DWC2 HS OTG; the vendor's "sprd,usb" */
+		usb: usb@20200000 {
+			compatible = "sprd,sc7731g-dwc2", "snps,dwc2";
+			reg = <0x20200000 0x1000>;
+			interrupts = <GIC_SPI 55 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clk_usb_ref>;
+			clock-names = "otg";
+			phys = <&usb_phy>;
+			phy-names = "usb2-phy";
+			status = "disabled";
+		};
+
+		/* the eMMC slot; SD (0x20300000) and SDIO (0x20400000, the
+		 * WCN) are the same controller and come later */
+		emmc: mmc@20600000 {
+			compatible = "sprd,sc7731g-sdhci";
+			reg = <0x20600000 0x1000>;
+			interrupts = <GIC_SPI 60 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clk_emmc_fixed>;
+			sprd,delays = <4 4 4>;
+			bus-width = <8>;
+			non-removable;
+			no-sd;
+			no-sdio;
+			cap-mmc-highspeed;
+			/* RST_n is wired (SOFTWARE_RESET bit 3) and enabled in the card */
+			cap-mmc-hw-reset;
+			no-1-8-v;
+			status = "disabled";
+		};
+
+		/* 256 GPIOs in banks of 16; the vendor's "d-gpio" has the
+		 * register layout mainline's gpio-sprd drives. Pin muxing is
+		 * still whatever U-Boot set (no pinctrl driver yet) */
+		gpio: gpio@40280000 {
+			compatible = "sprd,sc7731g-gpio", "sprd,sc9860-gpio";
+			reg = <0x40280000 0x1000>;
+			gpio-controller;
+			#gpio-cells = <2>;
+			interrupt-controller;
+			#interrupt-cells = <2>;
+			interrupts = <GIC_SPI 35 IRQ_TYPE_LEVEL_HIGH>;
+		};
+
+		/* one block per CPU (timer 0 is its tick), timer 1 of the first
+		 * is the clocksource; IRQs as the vendor's local timers had them */
+		timer@40050000 {
+			compatible = "sprd,sc7731g-timer";
+			reg = <0x40050000 0x1000>, <0x40220000 0x1000>,
+			      <0x40330000 0x1000>, <0x40340000 0x1000>;
+			interrupts = <GIC_SPI 28 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 29 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 119 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 121 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&ext_32k>;
+			sprd,aon-apb = <&aon_apb>;
+		};
+
+		/* four channels, 0x20 apart; CNT holds duty and mod
+		 * together (pwm-sprd-sc7731g.c). Off 26 MHz as the vendor ran
+		 * the backlight's */
+		pwm: pwm@40260000 {
+			compatible = "sprd,sc7731g-pwm";
+			reg = <0x40260000 0x1000>;
+			clocks = <&clk_pwm0>, <&clk_pwm1>, <&clk_pwm2>, <&clk_pwm3>;
+			clock-names = "pwm0", "pwm1", "pwm2", "pwm3";
+			assigned-clocks = <&clk_pwm3>;
+			assigned-clock-parents = <&ext_26m>;
+			#pwm-cells = <2>;
+			status = "disabled";
+		};
+
+		/* the vendor's "sprd,i2c": byte-at-a-time, polled
+		 * (i2c-sprd-sc7731g.c), clocked from 26 MHz as it assumed */
+		i2c0: i2c@70500000 {
+			compatible = "sprd,sc7731g-i2c";
+			reg = <0x70500000 0x1000>;
+			interrupts = <GIC_SPI 11 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clk_i2c0>;
+			assigned-clocks = <&clk_i2c0>;
+			assigned-clock-parents = <&ext_26m>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
+		i2c1: i2c@70600000 {
+			compatible = "sprd,sc7731g-i2c";
+			reg = <0x70600000 0x1000>;
+			interrupts = <GIC_SPI 12 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clk_i2c1>;
+			assigned-clocks = <&clk_i2c1>;
+			assigned-clock-parents = <&ext_26m>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
+		i2c2: i2c@70700000 {
+			compatible = "sprd,sc7731g-i2c";
+			reg = <0x70700000 0x1000>;
+			interrupts = <GIC_SPI 13 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clk_i2c2>;
+			assigned-clocks = <&clk_i2c2>;
+			assigned-clock-parents = <&ext_26m>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
+		i2c3: i2c@70800000 {
+			compatible = "sprd,sc7731g-i2c";
+			reg = <0x70800000 0x1000>;
+			interrupts = <GIC_SPI 14 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clk_i2c3>;
+			assigned-clocks = <&clk_i2c3>;
+			assigned-clock-parents = <&ext_26m>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
+		/* mainline's sprd_serial was upstreamed for the SC9836, this
+		 * generation's sibling; clocked from 26 MHz as the vendor's
+		 * "sprdclk" says (the driver's default when it has no clock) */
+		uart0: serial@70000000 {
+			compatible = "sprd,sc7731g-uart", "sprd,sc9836-uart";
+			reg = <0x70000000 0x100>;
+			interrupts = <GIC_SPI 2 IRQ_TYPE_LEVEL_HIGH>;
+			status = "disabled";
+		};
+
+		uart1: serial@70100000 {
+			compatible = "sprd,sc7731g-uart", "sprd,sc9836-uart";
+			reg = <0x70100000 0x100>;
+			interrupts = <GIC_SPI 3 IRQ_TYPE_LEVEL_HIGH>;
+			status = "disabled";
+		};
+
+		uart2: serial@70200000 {
+			compatible = "sprd,sc7731g-uart", "sprd,sc9836-uart";
+			reg = <0x70200000 0x100>;
+			interrupts = <GIC_SPI 4 IRQ_TYPE_LEVEL_HIGH>;
+			status = "disabled";
+		};
+
+		uart3: serial@70300000 {
+			compatible = "sprd,sc7731g-uart", "sprd,sc9836-uart";
+			reg = <0x70300000 0x100>;
+			interrupts = <GIC_SPI 5 IRQ_TYPE_LEVEL_HIGH>;
+			status = "disabled";
+		};
+
+		/* The WCN co-processor (cp2) and the SIPC transport that talks
+		 * to it. Modelled on the vendor's scproc@8a800000 "cpwcn" plus
+		 * sipc_wcn, as one node: the loader and the SIPC smem window
+		 * come as a set. Reserved regions and firmware are at the board
+		 * level (sc7731g-vtimes-vt10101.dts). The children are the
+		 * radios on top: Wi-Fi and Bluetooth. */
+		wcn: wcn@8a800000 {
+			compatible = "sprd,sc7731g-wcn";
+			reg = <0x8a800000 0x201000>,
+			      <0x87940000 0xc0000>,
+			      <0x402c0000 0x8>,
+			      <0x50003000 0x100>;
+			reg-names = "cp2", "smem", "ipi", "iram";
+			sprd,pmu-apb = <&pmu_apb>;
+			sprd,aon-apb = <&aon_apb>;
+			/* SPI 73: cp2 -> AP smsg doorbell.
+			 * SPI 85: cp2's watchdog. */
+			interrupts = <GIC_SPI 73 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 85 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "sipc", "watchdog";
+			memory-region = <&cp2_mem>, <&cp_shm>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+
+			sprdwl: wifi {
+				compatible = "sprd,sc7731g-sprdwl";
+				status = "disabled";
+			};
+
+			/* HCI over sbuf ring 10 (the vendor's stty4bt) */
+			sprdbt: bluetooth {
+				compatible = "sprd,sc7731g-bt";
+				status = "disabled";
+			};
+		};
+	};
+};

@@ -1,0 +1,159 @@
+--- a/drivers/dma/sprd-dma.c	2026-10-29 07:33:59
++++ b/drivers/dma/sprd-dma.c	2026-10-29 07:34:37
+@@ -15,6 +15,7 @@
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/of_dma.h>
++#include <linux/property.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/slab.h>
+@@ -204,12 +205,49 @@
+ 	struct sprd_dma_desc	*cur_desc;
+ };
+ 
++/*
++ * What differs between the SoCs this driver knows. SC9860 is the original;
++ * SC7731G (SCX30G) has the same register layout -- its vendor driver is
++ * drivers/platform/sprd/dma_r4p0.c -- except as described here.
++ */
++struct sprd_dma_variant {
++	u32 pause_sts;		/* the CHN_PAUSE bit that says it paused */
++	u32 int_sts_shift;	/* where CHN_INTC's five status bits start */
++	u32 first_slave_chn;	/* lower channels lack TRSC_LEN and link lists */
++	bool no_pending;	/* no REQ_PEND*_EN writes */
++	bool no_wait_bdone;	/* leave CFG bit 24 (DONOT_WAIT_BDONE) clear */
++	bool max_width_4;	/* no 8-byte datawidth */
++};
++
++static const struct sprd_dma_variant sc9860_dma = {
++	.pause_sts = BIT(2),
++	.int_sts_shift = 16,
++};
++
++/*
++ * SC7731G, from the vendor's dma_r4p0.c (Samsung SM-G531H GPL source):
++ * pause status is bit 16; channels 0-23 are "standard" (registers only to
++ * 0x1c), so device requests go to 24-31; the vendor never writes the
++ * REQ_PEND registers or CFG bit 24, and only knows widths of 1, 2 and 4
++ * bytes. Its INTC status bits are taken from the sibling sharkl64 driver
++ * (8-12); the r4p0 driver never reads them (docs/audio.md).
++ */
++static const struct sprd_dma_variant sc7731g_dma = {
++	.pause_sts = BIT(16),
++	.int_sts_shift = 8,
++	.first_slave_chn = 24,
++	.no_pending = true,
++	.no_wait_bdone = true,
++	.max_width_4 = true,
++};
++
+ /* SPRD dma device */
+ struct sprd_dma_dev {
+ 	struct dma_device	dma_dev;
+ 	void __iomem		*glb_base;
+ 	struct clk		*clk;
+ 	struct clk		*ashb_clk;
++	const struct sprd_dma_variant *var;
+ 	int			irq;
+ 	u32			total_chns;
+ 	struct sprd_dma_chn	channels[] __counted_by(total_chns);
+@@ -348,7 +386,7 @@
+ 
+ 		do {
+ 			pause = readl(schan->chn_base + SPRD_DMA_CHN_PAUSE);
+-			if (pause & SPRD_DMA_PAUSE_STS)
++			if (pause & sdev->var->pause_sts)
+ 				break;
+ 
+ 			cpu_relax();
+@@ -399,8 +437,9 @@
+ static enum sprd_dma_int_type sprd_dma_get_int_type(struct sprd_dma_chn *schan)
+ {
+ 	struct sprd_dma_dev *sdev = to_sprd_dma_dev(&schan->vc.chan);
+-	u32 intc_sts = readl(schan->chn_base + SPRD_DMA_CHN_INTC) &
+-		       SPRD_DMA_CHN_INT_STS;
++	/* the status bits as SC9860 places them, from wherever this SoC does */
++	u32 intc_sts = ((readl(schan->chn_base + SPRD_DMA_CHN_INTC) >>
++			 sdev->var->int_sts_shift) << 16) & SPRD_DMA_CHN_INT_STS;
+ 
+ 	switch (intc_sts) {
+ 	case SPRD_DMA_CFGERR_INT_STS:
+@@ -491,7 +530,7 @@
+ 	struct sprd_dma_dev *sdev = to_sprd_dma_dev(&schan->vc.chan);
+ 	u32 reg, val, req_id;
+ 
+-	if (schan->dev_id == SPRD_DMA_SOFTWARE_UID)
++	if (schan->dev_id == SPRD_DMA_SOFTWARE_UID || sdev->var->no_pending)
+ 		return;
+ 
+ 	/* The DMA request id always starts from 0. */
+@@ -793,7 +832,8 @@
+ 		return dst_datawidth;
+ 	}
+ 
+-	hw->cfg = SPRD_DMA_DONOT_WAIT_BDONE << SPRD_DMA_WAIT_BDONE_OFFSET;
++	hw->cfg = sdev->var->no_wait_bdone ? 0 :
++		SPRD_DMA_DONOT_WAIT_BDONE << SPRD_DMA_WAIT_BDONE_OFFSET;
+ 
+ 	/*
+ 	 * wrap_ptr and wrap_to will save the high 4 bits source address and
+@@ -896,6 +936,7 @@
+ 			 size_t len, unsigned long flags)
+ {
+ 	struct sprd_dma_chn *schan = to_sprd_dma_chan(chan);
++	struct sprd_dma_dev *sdev = to_sprd_dma_dev(chan);
+ 	struct sprd_dma_desc *sdesc;
+ 	struct sprd_dma_chn_hw *hw;
+ 	enum sprd_dma_datawidth datawidth;
+@@ -907,7 +948,8 @@
+ 
+ 	hw = &sdesc->chn_hw;
+ 
+-	hw->cfg = SPRD_DMA_DONOT_WAIT_BDONE << SPRD_DMA_WAIT_BDONE_OFFSET;
++	hw->cfg = sdev->var->no_wait_bdone ? 0 :
++		SPRD_DMA_DONOT_WAIT_BDONE << SPRD_DMA_WAIT_BDONE_OFFSET;
+ 	hw->intc = SPRD_DMA_TRANS_INT | SPRD_DMA_CFG_ERR_INT_EN;
+ 	hw->src_addr = src & SPRD_DMA_LOW_ADDR_MASK;
+ 	hw->des_addr = dest & SPRD_DMA_LOW_ADDR_MASK;
+@@ -916,7 +958,7 @@
+ 	hw->wrap_to = (dest >> SPRD_DMA_HIGH_ADDR_OFFSET) &
+ 		SPRD_DMA_HIGH_ADDR_MASK;
+ 
+-	if (IS_ALIGNED(len, 8)) {
++	if (IS_ALIGNED(len, 8) && !sdev->var->max_width_4) {
+ 		datawidth = SPRD_DMA_DATAWIDTH_8_BYTES;
+ 		step = SPRD_DMA_DWORD_STEP;
+ 	} else if (IS_ALIGNED(len, 4)) {
+@@ -1101,8 +1143,11 @@
+ static bool sprd_dma_filter_fn(struct dma_chan *chan, void *param)
+ {
+ 	struct sprd_dma_chn *schan = to_sprd_dma_chan(chan);
++	struct sprd_dma_dev *sdev = to_sprd_dma_dev(chan);
+ 	u32 slave_id = *(u32 *)param;
+ 
++	if (schan->chn_num < sdev->var->first_slave_chn)
++		return false;
+ 	schan->dev_id = slave_id;
+ 	return true;
+ }
+@@ -1176,6 +1221,9 @@
+ 
+ 	dma_cap_set(DMA_MEMCPY, sdev->dma_dev.cap_mask);
+ 	sdev->total_chns = chn_count;
++	sdev->var = of_device_get_match_data(&pdev->dev);
++	if (!sdev->var)
++		sdev->var = &sc9860_dma;
+ 	INIT_LIST_HEAD(&sdev->dma_dev.channels);
+ 	INIT_LIST_HEAD(&sdev->dma_dev.global_node);
+ 	sdev->dma_dev.dev = &pdev->dev;
+@@ -1264,7 +1312,8 @@
+ }
+ 
+ static const struct of_device_id sprd_dma_match[] = {
+-	{ .compatible = "sprd,sc9860-dma", },
++	{ .compatible = "sprd,sc9860-dma", .data = &sc9860_dma },
++	{ .compatible = "sprd,sc7731g-dma", .data = &sc7731g_dma },
+ 	{},
+ };
+ MODULE_DEVICE_TABLE(of, sprd_dma_match);

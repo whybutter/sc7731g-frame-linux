@@ -1,0 +1,72 @@
+#!/bin/sh
+# cp2test: the first Wi-Fi step (docs/wifi.md) as one unattended boot. Loads
+# the WCN firmware, starts cp2 the way the vendor's /proc/cpwcn/start does,
+# then checks that it answers over SIPC (bin/cp2, initramfs/cp2.c). Every
+# line starts with "cp2:" for grepping the UART log. cp2 is stopped again at
+# the end unless `cp2keep` is on the command line, for poking at it over
+# usbnet.
+#
+# wifi1 (2026-10-27) read the firmware from the wcnmodem partition, and the
+# warm restart after it died in the boot ROM ("MCI ERF" twice, then "ROM":
+# the ROM couldn't read the eMMC). It had also started and stopped cp2, so
+# the two are separated now. The firmware comes from the initramfs
+# (firmware/wcnmodem.bin, a copy of p9 cut from the backup; gitignored), so
+# this test never touches the eMMC unless `cp2emmc` asks for the partition.
+# Everything else start changed is put back after stop: the AON gate bits
+# and the IRAM words.
+
+case " $(cat /proc/cmdline) " in
+  *" cp2emmc "*)
+    # the eMMC may still be probing when init gets here
+    p=
+    n=0
+    while [ -z "$p" ] && [ $n -lt 20 ]; do
+      for u in /sys/class/block/mmcblk*p*/uevent; do
+        grep -qx 'PARTNAME=wcnmodem' "$u" 2>/dev/null &&
+          p=/dev/$(sed -n 's/^DEVNAME=//p' "$u")
+      done
+      [ -n "$p" ] || { sleep 1; n=$((n + 1)); }
+    done ;;
+  *) p=/lib/firmware/wcnmodem.bin; [ -f "$p" ] || p= ;;
+esac
+[ -n "$p" ] || { echo "cp2: no firmware, giving up"; exit 1; }
+echo "cp2: firmware from $p"
+
+# what start changes outside cp2's own memory, to put back afterwards
+aon0=$(devmem 0x402e0000 32)
+iram0=$(devmem 0x50003000 32)
+iram4=$(devmem 0x50003004 32)
+iram8=$(devmem 0x50003008 32)
+
+echo "cp2: --- as the boot left it"
+cp2 regs
+cp2 stop
+cp2 load "$p" || { echo "cp2: load failed, giving up"; exit 1; }
+echo "cp2: --- loaded, before start"
+cp2 regs
+cp2 start
+sleep 2
+echo "cp2: --- 2 s after start (tailsum changed = cp2 ran)"
+cp2 regs
+cp2 hello 10
+echo "cp2: --- after hello"
+cp2 regs
+echo "cp2: --- anything else cp2 says in 5 s"
+cp2 watch 5
+echo "cp2: --- the sbuf rings at the end"
+cp2 rings
+case " $(cat /proc/cmdline) " in
+  *" cp2keep "*) echo "cp2: left running (cp2keep)" ;;
+  *)
+    cp2 stop
+    # AON_APB EB0 bits 21-23: IPI and MSPI are ours, bit 22 (SPLK) came
+    # on while cp2 ran; the rest of the word as it is now
+    aon=$(devmem 0x402e0000 32)
+    devmem 0x402e0000 32 $(( (aon & ~0xe00000) | (aon0 & 0xe00000) ))
+    devmem 0x50003000 32 "$iram0"
+    devmem 0x50003004 32 "$iram4"
+    devmem 0x50003008 32 "$iram8"
+    echo "cp2: restored aon_apb_eb0 bits 21-23 and the IRAM words"
+    cp2 regs ;;
+esac
+echo "cp2: done"

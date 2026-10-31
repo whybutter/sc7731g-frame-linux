@@ -1,0 +1,38 @@
+sc7731g-frame-linux
+===================
+
+No vendor firmware is included in this repository, and none ever will be.
+
+The SC7731G frame needs four pieces of vendor firmware to work under Linux:
+
+- the WCN co-processor's firmware (Wi-Fi and Bluetooth), Spreadtrum/Unisoc's;
+- the Wi-Fi calibration block, built from the vendor's calibration files;
+- the Bluetooth PSKEY block, built from the vendor's configuration file and,
+  for its Bluetooth address, the frame's own serial number;
+- the GSL1680 touch controller's firmware, Silead's, as compiled into the
+  frame's Android kernel.
+
+None of them is ours to redistribute, and some carry per-unit data. So this
+repository carries only tools that extract them from the frame you own
+(firmware/extract.sh, tools/), the SHA-256 checksums of the inputs and
+outputs we tested with (firmware/SHA256SUMS), and the description of any
+patch applied to them (firmware/patches/). The PSKEY is built on the frame
+itself at boot (rootfs/usr/lib/sc7731g-bt/pskey.sh). The same goes for the
+vendor's U-Boot and boot ROM: they stay on the frame, untouched and not
+copied here.
+
+Register layouts, struct offsets and command ids in the drivers and docs
+were learned from the frame's own firmware and from Samsung's GPL kernel
+source for the SM-G531H (the same SoC), for interoperability.
+
+Licences
+--------
+
+- kernel/*.c, kernel/*.h, kernel/mach-sprd/, kernel/patches/: GPL-2.0-only
+  (some GPL-2.0-or-later), as each file's SPDX header says. They are Linux
+  drivers and changes to Linux.
+- kernel/*.dts, kernel/*.dtsi: GPL-2.0+ OR MIT, as the kernel's device trees
+  are.
+- initramfs/*.c: GPL-2.0-only (they are built into the kernel image).
+- c3-hci/: Apache-2.0 (c3-hci/LICENSE).
+- Everything else written for this project: MIT (LICENSE).

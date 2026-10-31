@@ -1,0 +1,370 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * VTimes VT10101 photo frame: SC7731G on the "si006asb" reference board
+ * (sp7731g_1h10), 2 GiB, 1280x800 MIPI-DSI panel (ID 0x936500) with gslX680
+ * touch on i2c1, UART console on the GND/TX/RX pads on the back (uart1).
+ */
+/dts-v1/;
+
+#include "sc7731g.dtsi"
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+
+/ {
+	model = "VTimes VT10101";
+	compatible = "vtimes,vt10101", "sprd,sc7731g";
+
+	aliases {
+		serial1 = &uart1;
+		i2c1 = &i2c1;
+		i2c2 = &i2c2;
+	};
+
+	chosen {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+		/* no stdout-path and no console= on uart1 since 2026-10-29:
+		 * the pads are for an ESP32-C3 BLE controller (docs/ble-c3.md).
+		 * Ways back to a serial console: a debug boot through
+		 * tools/uboot-cmd.py passes its own console=ttyS1 (the vendor
+		 * U-Boot still prints there), and kernel-trial.sh can boot an
+		 * older image with this line once from recovery */
+		/*
+		 * The command line for boots through the vendor U-Boot's cboot
+		 * (the boot partition, docs/install-plan.md): cboot
+		 * ignores the boot image header's cmdline and appends its own
+		 * arguments (lcd_id=..., mem_cs=...) to this property, as the
+		 * Phase 1 trial showed (2026-10-27). uboot-boot.py's bootm boots
+		 * pass their own bootargs and replace it. fbcon=rotate:1 makes
+		 * the console upright in the landscape hold; frameboot, wdt and
+		 * usbnet are initramfs switches (initramfs/init): frameboot
+		 * (2026-10-27) boots the userland from the eMMC's A/B slots, and
+		 * when it can't (or FRAMEBOOT/noframeboot exists) the boot falls
+		 * through to wdt, usbnet and the debug shell as before.
+		 * g_ether's MACs are fixed (locally administered) as the A33
+		 * frames fix theirs (random ones made a Mac host a new enX every
+		 * boot), but in :08: rather than the A33's :07:, so a host never
+		 * mixes up the two frames' links.
+		 *
+		 * nohlt: a STOPGAP (2026-10-27). With the cores idling in WFI
+		 * the eMMC controller stalls mid-command within seconds (no
+		 * completion, no error, no interrupt; DMA or PIO alike); with
+		 * nohlt it moved 300 MB read / 64 MB written + verified with no
+		 * error. Some clock gate besides the AP_SYS_AUTO_SLEEP_CFG ones
+		 * platsmp.c clears still cuts the controller when every core is
+		 * idle. Costs idle power; goes once that gate is found.
+		 */
+		bootargs = "console=tty1 fbcon=rotate:1 panic=5 printk.devkmsg=on nohlt g_ether.dev_addr=02:fa:a3:00:08:02 g_ether.host_addr=02:fa:a3:00:08:01 frameboot wdt usbnet";
+
+		/*
+		 * Until there is a display driver: the vendor U-Boot lights the
+		 * panel and leaves the display controller scanning its splash
+		 * buffer out (layer 0 at 0x9fdfc000, 800x1280, 16 bpp, read back
+		 * from DISPC at 0x20800040), so the kernel can draw into it.
+		 */
+		framebuffer@9fdfc000 {
+			compatible = "simple-framebuffer";
+			reg = <0x9fdfc000 0x1f4000>;
+			width = <800>;
+			height = <1280>;
+			stride = <1600>;
+			format = "r5g6b5";
+		};
+	};
+
+	/*
+	 * The vendor U-Boot rewrites this from what it sized (512 MiB on
+	 * chip-select 0): the second 1 GiB of the 2 GiB, and the rest of the
+	 * first, wait until we own the boot chain.
+	 */
+	memory@80000000 {
+		device_type = "memory";
+		reg = <0x80000000 0x20000000>;
+	};
+
+	/* PWM3 into the backlight controller, at the vendor's ~101.6 kHz
+	 * (26 MHz / 256); its levels were 0-255 straight onto the duty */
+	backlight: backlight {
+		compatible = "pwm-backlight";
+		pwms = <&pwm 3 9846>;
+		brightness-levels = <0 255>;
+		num-interpolated-steps = <255>;
+		default-brightness-level = <200>;
+	};
+
+	/* VBUS for host mode: the vendor DT's usb node has boost-gpios = GPIO
+	 * 69, the enable of a 5 V boost onto the micro-USB's VBUS (its
+	 * dwc_otg driver raises it in charge_pump_set() when an OTG cable's ID
+	 * goes low, and drops it on unplug). dwc2 enables a vbus-supply only
+	 * while it is host, so in gadget mode this stays off as before. The
+	 * frame runs off its barrel jack; whether the boost is fitted on this
+	 * board is what the first host-mode boot says */
+	otg_vbus: regulator-otg-vbus {
+		compatible = "regulator-fixed";
+		regulator-name = "otg-vbus";
+		regulator-min-microvolt = <5000000>;
+		regulator-max-microvolt = <5000000>;
+		gpio = <&gpio 69 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+	};
+
+	reserved-memory {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		/* the vendor's own /memreserve/s: modem (CP0) and WCN (CP2)
+		 * shared memory; nothing runs there when we boot from the
+		 * U-Boot prompt, but they stay out of the way until we know */
+		cp_shm: cp-shm@87800000 {
+			reg = <0x87800000 0x200000>;
+			no-map;
+		};
+
+		cp0@88000000 {
+			reg = <0x88000000 0x1b00000>;
+			no-map;
+		};
+
+		cp2_mem: cp2@8a800000 {
+			reg = <0x8a800000 0x201000>;
+			no-map;
+		};
+
+		/* the last kernel log across a crash and reboot (pstore/ramoops;
+		 * the userland's frame-diag copies the records to FRAMEBOOT/diag):
+		 * the WCN driver brought the frame down hard during a scan
+		 * with nothing left to read (2026-10-29). Inside the first
+		 * 512 MiB, the DT's own memory node, just under the splash
+		 * buffer. Strong ECC as on the A33 frame, whose DRAM loses bits
+		 * across the reset (that frame's kernel dts); whether this
+		 * one's does is still to be seen */
+		ramoops@9fc00000 {
+			compatible = "ramoops";
+			reg = <0x9fc00000 0x100000>;
+			record-size = <0x20000>;
+			console-size = <0x40000>;
+			pmsg-size = <0x20000>;
+			ecc-size = <64>;
+		};
+
+		splash@9fdfc000 {
+			reg = <0x9fdfc000 0x1f4000>;
+			no-map;
+		};
+	};
+};
+
+&uart1 {
+	status = "okay";
+};
+
+/* read-only use so far: the partition table and mounts happen by hand from
+ * the initramfs shell */
+&emmc {
+	status = "okay";
+};
+
+/* takes over from simpledrm once probed; 10.1" 16:10, portrait-native */
+&dispc {
+	width-mm = <136>;
+	height-mm = <217>;
+	status = "okay";
+};
+
+&gpu {
+	status = "okay";
+};
+
+/*
+ * The gslX680 touch controller (Silead GSL1680 family). The vendor DT gives
+ * it two GPIOs, 81 then 82, which its driver takes as reset then interrupt.
+ * Its firmware is loaded at every power-up: mainline's silead driver reads
+ * silead/gsl1680.fw, extracted from the Android kernel by
+ * tools/extract-gsl-fw.py. Its 1024x600 TP_MAX in the vendor DT is a leftover
+ * from another panel; the size here is the glass's, to be checked with evtest.
+ * vdd28 (its supply, a PMIC LDO) was left as U-Boot left it until there
+ * were regulators; out-3 got -ENXIO at 0x40, as if it were off (or the chip
+ * held in reset). regulator-sc2713s.c now switches it on.
+ */
+/* the sensor bus: Android binds a da213 accelerometer at 0x26 here. Enabled
+ * with no children so far, only so the probe can check our I2C driver
+ * against a chip known to answer (initramfs/i2cxfer.c) */
+&i2c2 {
+	status = "okay";
+
+	/*
+	 * The accelerometer frame-shell turns the screen by (its Accel class
+	 * reads an IIO device named "da280"). Android's DT lists six
+	 * alternative sensors on this bus, a reference board's options; the
+	 * one fitted is MiraMEMS's ("mir3da_acc", compatible da,da213, reg
+	 * 0x26), but it answers at 0x27 -- the vendor's mir3da driver tries
+	 * both -- with chip ID 0x13 at register 0x01, which is what mainline's
+	 * da280 driver checks for. It has no OF table, so the I2C core binds
+	 * it by name. Its axes are this board's, not the A33's: the userland's
+	 * accelerometer signs are per board (2026-10-28).
+	 */
+	accelerometer@27 {
+		compatible = "miramems,da280";
+		reg = <0x27>;
+	};
+};
+
+&i2c1 {
+	status = "okay";
+
+	touchscreen@40 {
+		compatible = "silead,gsl1680";
+		reg = <0x40>;
+		interrupt-parent = <&gpio>;
+		interrupts = <82 IRQ_TYPE_EDGE_FALLING>;
+		power-gpios = <&gpio 81 GPIO_ACTIVE_HIGH>;
+		/* the vendor DT's vdd_name; out-3 got -ENXIO from the chip
+		 * with nothing switching this on */
+		avdd-supply = <&vdd28>;
+		/* its reset and interrupt pads' I/O rail, see &vddsim2 */
+		vddio-supply = <&vddsim2>;
+		firmware-name = "gsl1680.fw";	/* the driver prepends silead/ */
+		/* The firmware reports in its own landscape frame: X along the
+		 * long side left to right, Y along the short side from the
+		 * bottom up, ~1024 x 640 (our corner taps, 2026-10-27,
+		 * spanned 91..934 and 60..616; 1024 x 640 is the glass's 1.6
+		 * aspect). That is already the frame as it hangs, so only Y
+		 * flips.
+		 *
+		 * The first mapping swapped X and Y into the panel's native
+		 * portrait scan, on the idea that the compositor rotates touch
+		 * with the output. It doesn't: wlroots maps a touchscreen's
+		 * range linearly onto the output's transformed (landscape)
+		 * box, so touch must come in already landscape. frame-shell's
+		 * calibration page showed it -- a touch on cross 1 (top left)
+		 * landed on cross 2 (top right), as the swap predicts: raw
+		 * (91,539) became x 539 of 640 -> 1078 of 1280.
+		 *
+		 * The range is fitted, not the nominal 1024 x 640: with that,
+		 * our taps on the calibration crosses (frame-shell's
+		 * log, via frame-diag's 180s report, 2026-10-27) landed ~20-25
+		 * px toward the middle of the screen at every corner. A straight
+		 * line through 20 taps on 5 crosses puts the glass edges at raw
+		 * X 22..1004 and raw Y 6..614, residuals within ~8 px except
+		 * stray taps. Linux inverts Y as max - y, so Y can't carry a
+		 * minimum as well: max 614 makes the top exact and leaves the
+		 * bottom edge ~8 px short. */
+		touchscreen-min-x = <22>;
+		touchscreen-size-x = <1005>;	/* max = size - 1 */
+		touchscreen-size-y = <615>;
+		touchscreen-inverted-y;
+		silead,max-fingers = <10>;
+	};
+};
+
+&pwm {
+	status = "okay";
+};
+
+/*
+ * Sound: one speaker, on SPK-R, behind an external amplifier that GPIO 85
+ * enables (active high) and that the codec's HPR output feeds -- not the
+ * codec's own speaker driver, whose SPK-L has nothing on it. Found by hand
+ * with someone listening (docs/audio.md, 2026-10-28); the vendor DT's
+ * spk_pa_en_gpios = <85> says the same.
+ */
+&pmic {
+	audio_codec: audio-codec {
+		compatible = "sprd,sc2713s-codec";
+		sprd,reg-dp = <0x40000000 0x1000>;
+		sprd,syscon-aon = <&aon_apb>;
+		clocks = <&clk_aud>;
+		pa-gpios = <&gpio 85 GPIO_ACTIVE_HIGH>;
+		#sound-dai-cells = <0>;
+	};
+};
+
+&vbc {
+	status = "okay";
+};
+
+&vbc_pcm {
+	status = "okay";
+};
+
+/ {
+	sound {
+		compatible = "simple-audio-card";
+		simple-audio-card,name = "VT10101";
+
+		simple-audio-card,dai-link {
+			cpu {
+				sound-dai = <&vbc>;
+			};
+			codec {
+				sound-dai = <&audio_codec>;
+			};
+			plat {
+				sound-dai = <&vbc_pcm>;
+			};
+		};
+	};
+};
+
+/* always on: the touch driver turns its supply off in suspend, and we don't
+ * know what else on this board hangs off vdd28 */
+&vdd28 {
+	regulator-always-on;
+};
+
+/* always on as well: the touch driver drops vddio in suspend, and the other
+ * SIM2 pads' users are unknown */
+&vddsim2 {
+	regulator-always-on;
+	regulator-min-microvolt = <1800000>;
+	regulator-max-microvolt = <1800000>;
+};
+
+/*
+ * USB as a gadget by default: a network link (CDC ECM) to whatever the
+ * micro-USB port is plugged into, the debug link. Host mode, for a Wi-Fi
+ * dongle (the SoC's own WCN has no mainline driver, docs/wifi.md), is a
+ * runtime switch, see &usb. The vendor sensed VBUS on a GPIO; instead dwc2's role switch is
+ * pinned to peripheral, which overrides the B-session-valid signal.
+ */
+&usb_phy {
+	sprd,tune = <0x44073e33>;
+	/* out-3: dwc2's core soft reset timed out with no supply here */
+	vdd-supply = <&vddusb>;
+	status = "okay";
+};
+
+&usb {
+	dr_mode = "otg";
+	usb-role-switch;
+	/* still the default; `usbhost` on the command line has the initramfs
+	 * switch the role to host at runtime (/sys/class/usb_role), which
+	 * forces dwc2 into host mode and turns on vbus-supply. No DT variant:
+	 * one image does both, and a reboot is the way back to the debug link */
+	role-switch-default-mode = "peripheral";
+	vbus-supply = <&otg_vbus>;
+	/* out-4: with vddusb on, the core enumerated (high speed, address 8)
+	 * and then g_ether's endpoints found no FIFO -- dwc2's defaults (RX
+	 * 2048, non-periodic TX 1024) don't fit this core's 3598-entry SPRAM.
+	 * These do: 512 + 256 + 4 x 256 + 11 x 128 = 3200 */
+	g-rx-fifo-size = <512>;
+	g-np-tx-fifo-size = <256>;
+	g-tx-fifo-size = <256 256 256 256 128 128 128 128 128 128 128 128 128 128 128>;
+	status = "okay";
+};
+
+&wcn {
+	status = "okay";
+	firmware-name = "sprd/wcnmodem.bin";
+};
+
+&sprdwl {
+	status = "okay";
+	nvm-firmware-name = "sprd/wifi-nvm.bin";
+};
+
+&sprdbt {
+	status = "okay";
+};

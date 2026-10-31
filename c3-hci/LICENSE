@@ -1,0 +1,11 @@
+c3-hci is licensed under the Apache License, Version 2.0
+(SPDX: Apache-2.0), the licence of ESP-IDF, which it is built with and links
+against: https://www.apache.org/licenses/LICENSE-2.0
+
+main/main.c started from ESP-IDF 5.5's example
+examples/bluetooth/hci/controller_hci_uart_esp32c3_and_esp32s3, which
+Espressif publishes under "Unlicense OR CC0-1.0"; the changes for the frame
+(the silent start, the pins, the reset replay) are ours, under Apache-2.0.
+
+The Bluetooth controller itself is Espressif's closed library, shipped with
+ESP-IDF under its own terms; nothing of it is in this repository.
